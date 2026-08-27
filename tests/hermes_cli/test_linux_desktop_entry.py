@@ -23,6 +23,7 @@ def _make_project(tmp_path: Path) -> Path:
     icon = root / "apps" / "desktop" / "assets" / "icon.png"
     icon.parent.mkdir(parents=True)
     icon.write_bytes(b"\x89PNG fake")
+    (root / "hermes").write_text("#!/usr/bin/env python3\n", encoding="utf-8")
     return root
 
 
@@ -86,6 +87,22 @@ def test_exec_falls_back_to_interpreter_module(tmp_path, xdg_home, monkeypatch):
 
     assert exec_line.endswith("-m hermes_cli.main desktop")
     assert Path(exec_line.split(" ")[0]).is_absolute()
+
+
+def test_exec_prefers_project_venv_over_the_current_interpreter(tmp_path, xdg_home, monkeypatch):
+    root = _make_project(tmp_path)
+    venv_python = root / "venv" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.write_text("", encoding="utf-8")
+    venv_python.chmod(0o755)
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: "/wrong/hermes")
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    assert entry is not None
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    assert exec_line == f"{venv_python} {root / 'hermes'} desktop"
 
 
 # #90292: the shell installer's bash wrapper makes argv[0] the repo `hermes`
