@@ -1482,6 +1482,8 @@ def cronjob(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    retry_count: Optional[int] = None,
+    retry_delay_seconds: Optional[int] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
 ) -> str:
@@ -1518,6 +1520,21 @@ def cronjob(
                 scan_error = _scan_cron_prompt(prompt)
                 if scan_error:
                     return tool_error(scan_error, success=False)
+
+            if retry_count is not None:
+                if retry_count < 0:
+                    return tool_error("retry_count must be zero or a positive integer", success=False)
+                if retry_delay_seconds is not None and retry_delay_seconds <= 0:
+                    return tool_error("retry_delay_seconds must be positive", success=False)
+                retry_policy = (
+                    {"max_retries": retry_count, "delay_seconds": retry_delay_seconds or 300}
+                    if retry_count > 0
+                    else None
+                )
+            elif retry_delay_seconds is not None:
+                return tool_error("retry_delay_seconds requires retry_count", success=False)
+            else:
+                retry_policy = None
 
             # Validate script path before storing
             if script:
@@ -1598,6 +1615,7 @@ def cronjob(
                     # dispatch below: models do not make model-config
                     # decisions (standing policy).
                     reasoning_effort=reasoning_effort,
+                    retry_policy=retry_policy,
                 )
             except CronSchedulerRegistrationError as exc:
                 _partial = exc.to_dict()
@@ -1814,6 +1832,26 @@ def cronjob(
                 # CLI-only lane (see create above): update_job validates
                 # against the canonical grammar; empty string clears the pin.
                 updates["reasoning_effort"] = reasoning_effort
+            if retry_count is not None:
+                if retry_count < 0:
+                    return tool_error("retry_count must be zero or a positive integer", success=False)
+                if retry_count == 0:
+                    updates["retry_policy"] = None
+                else:
+                    existing_policy = job.get("retry_policy") or {}
+                    delay = (
+                        retry_delay_seconds
+                        if retry_delay_seconds is not None
+                        else existing_policy.get("delay_seconds", 300)
+                    )
+                    if delay <= 0:
+                        return tool_error("retry_delay_seconds must be positive", success=False)
+                    updates["retry_policy"] = {
+                        "max_retries": retry_count,
+                        "delay_seconds": delay,
+                    }
+            elif retry_delay_seconds is not None:
+                return tool_error("retry_delay_seconds requires retry_count", success=False)
             # Re-validate the EFFECTIVE provider/base_url on EVERY update, not
             # only when this update supplies provider/base_url. A job persisted
             # before this guard (or written directly to the jobs store) may
@@ -2024,6 +2062,14 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
                 "type": "boolean",
                 "description": "True = the job's delivery is CONTINUABLE — the user can reply and the agent has the brief in context (threads on thread-capable platforms, mirrored into the DM elsewhere). Use for conversational recurring jobs (briefings); leave unset for fire-and-forget alerts. Scope: the job's own conversation only — the origin chat, the home-channel fallback when deliver='origin' captured no origin (script-created jobs), or the job's single explicit platform:chat target (this flag is the only way to attach an explicit target). Broadcast targets are never attached; no effect when deliver='local'."
             },
+            "retry_count": {
+                "type": "integer",
+                "description": "Optional per-job retries after a transient provider failure. 0 disables whole-job retries. Positive values schedule that many additional fresh runs; default retry_delay_seconds is 300."
+            },
+            "retry_delay_seconds": {
+                "type": "integer",
+                "description": "Delay in seconds between transient whole-job retries. Requires retry_count; default is 300 seconds."
+            },
         },
         "required": ["action"]
     }
@@ -2092,6 +2138,8 @@ def _cronjob_handler(args, **kw):
         attach_to_session=args.get("attach_to_session"),
         monitor_script=_mon_script,
         monitor_url=_mon_url,
+        retry_count=args.get("retry_count"),
+        retry_delay_seconds=args.get("retry_delay_seconds"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
     )

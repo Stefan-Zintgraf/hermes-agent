@@ -1999,6 +1999,7 @@ def create_job(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    retry_policy: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -2206,6 +2207,8 @@ def create_job(
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
     }
+    if retry_policy is not None:
+        job["retry_policy"] = retry_policy
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
     # global cron.mirror_delivery config, default off).
@@ -2648,6 +2651,8 @@ def mark_job_run(
     status: Optional[str] = None,
     *,
     expected_fire_owner: Optional[str] = None,
+    next_run_at_override: Optional[str] = None,
+    retry_state: Optional[Dict[str, Any]] = None,
 ) -> bool:
     with _fire_job_lock(job_id) as acquired:
         if not acquired:
@@ -2659,6 +2664,8 @@ def mark_job_run(
             delivery_error,
             status=status,
             expected_fire_owner=expected_fire_owner,
+            next_run_at_override=next_run_at_override,
+            retry_state=retry_state,
         )
 
 
@@ -2753,6 +2760,8 @@ def _mark_job_run_locked(
     *,
     status: Optional[str] = None,
     expected_fire_owner: Optional[str] = None,
+    next_run_at_override: Optional[str] = None,
+    retry_state: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """
     Mark a job as having been run.
@@ -2809,8 +2818,16 @@ def _mark_job_run_locked(
                 # (Poke-inspired; see cron/scheduler._failure_streak_nudge).
                 if success:
                     job["failure_streak"] = 0
+                    job.pop("retry_state", None)
+                elif status == "retrying":
+                    # Intermediate transient failures are not a user-visible
+                    # failure streak; the retry state records their bounded
+                    # progress and the final exhausted attempt increments it.
+                    if retry_state is not None:
+                        job["retry_state"] = retry_state
                 else:
                     job["failure_streak"] = int(job.get("failure_streak") or 0) + 1
+                    job.pop("retry_state", None)
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
                 # Clear any external-fire claim so a re-armed recurring job can
@@ -2861,7 +2878,11 @@ def _mark_job_run_locked(
                         return True
                 
                 # Compute next run
-                job["next_run_at"] = compute_next_run(job["schedule"], now)
+                job["next_run_at"] = (
+                    next_run_at_override
+                    if next_run_at_override is not None
+                    else compute_next_run(job["schedule"], now)
+                )
 
                 # If no next run, decide whether this is terminal completion
                 # (one-shot) or a transient failure (recurring schedule couldn't

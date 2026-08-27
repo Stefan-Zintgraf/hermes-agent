@@ -25,7 +25,7 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -62,6 +62,65 @@ from agent.delegation_context import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# A full cron-job rerun is more consequential than the agent loop retrying a
+# single provider request.  Keep this allowlist deliberately narrow: credentials,
+# billing, malformed requests, tools, and scheduler failures require operator
+# intervention and must never be replayed automatically.
+_TRANSIENT_JOB_RETRY_REASONS = frozenset({
+    "overloaded",
+    "server_error",
+    "timeout",
+    "rate_limit",
+})
+
+
+def plan_transient_job_retry(
+    job: dict,
+    failure: dict,
+    *,
+    now: Optional[datetime] = None,
+) -> Optional[dict]:
+    """Return the durable retry state for an opted-in transient job failure.
+
+    The caller persists the returned mapping atomically with the terminal
+    bookkeeping.  ``None`` means that this failure is final: either retries
+    were not configured/exhausted, or the structured agent outcome is not one
+    of the narrowly allowed provider-transient cases.
+    """
+    policy = job.get("retry_policy")
+    if not isinstance(policy, dict):
+        return None
+    try:
+        max_retries = int(policy.get("max_retries", 0))
+        delay_seconds = int(policy.get("delay_seconds", 0))
+    except (TypeError, ValueError):
+        return None
+    if max_retries <= 0 or delay_seconds <= 0:
+        return None
+    if failure.get("origin") != "provider":
+        return None
+    if failure.get("reason") not in _TRANSIENT_JOB_RETRY_REASONS:
+        return None
+    if failure.get("retryable") is not True:
+        return None
+
+    retry_state = job.get("retry_state")
+    retries_used = 0
+    if isinstance(retry_state, dict):
+        try:
+            retries_used = max(0, int(retry_state.get("retries_used", 0)))
+        except (TypeError, ValueError):
+            retries_used = 0
+    if retries_used >= max_retries:
+        return None
+
+    retry_at = (now or _hermes_now()) + timedelta(seconds=delay_seconds)
+    return {
+        "retries_used": retries_used + 1,
+        "next_run_at": retry_at.isoformat(),
+    }
 
 
 def _close_late_session_db_result(future: "concurrent.futures.Future") -> None:
@@ -6602,6 +6661,15 @@ def run_job(
                 or final_response_text
                 or "agent reported failure"
             )
+            # Preserve the deterministic provider verdict for this in-process
+            # fire. Only the eventual retry decision is persisted; provider
+            # payloads themselves remain out of jobs.json.
+            if result.get("failure_reason"):
+                job["_cron_failure_metadata"] = {
+                    "origin": "provider",
+                    "reason": result.get("failure_reason"),
+                    "retryable": result.get("failure_retryable") is True,
+                }
             raise RuntimeError(_err_text)
         if max_iteration_summary:
             logger.warning(
@@ -7268,6 +7336,14 @@ def _run_one_job_body(
         # / empty-response computation, or _deliver_result itself — raises, the
         # deferred agent is still torn down. Otherwise the outer `except` would
         # swallow the error and leak the agent's subprocesses/clients (#10200).
+        retry_plan = (
+            plan_transient_job_retry(
+                job,
+                job.pop("_cron_failure_metadata", {}),
+            )
+            if not success
+            else None
+        )
         blocked_config = False
         side_effect_ownership_lost = False
         try:
@@ -7334,6 +7410,11 @@ def _run_one_job_body(
             else:
                 if success:
                     deliver_content = final_response
+                elif retry_plan is not None:
+                    # The retry is persisted with the terminal bookkeeping
+                    # below. Intermediate failures must not create incidents
+                    # or send alerts that would be stale after a recovery.
+                    deliver_content = ""
                 else:
                     # Durable failure incident: record this job+error
                     # signature once and, when the operator already acked it,
@@ -7482,6 +7563,12 @@ def _run_one_job_body(
             return True
 
         mark_kwargs = {"delivery_error": delivery_error}
+        if retry_plan is not None:
+            mark_kwargs.update({
+                "status": "retrying",
+                "next_run_at_override": retry_plan["next_run_at"],
+                "retry_state": {"retries_used": retry_plan["retries_used"]},
+            })
         if fire_owner is not None:
             mark_kwargs["expected_fire_owner"] = fire_owner
         if blocked_config:
