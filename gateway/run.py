@@ -20361,8 +20361,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: SessionSource,
         history: List[Dict[str, Any]],
         session_key: Optional[str] = None,
-    ) -> Optional[str]:
-        """Run inbound preprocessing under the routed profile when multiplexed."""
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Prepare model text and the original text to persist for an inbound turn."""
         if getattr(getattr(self, "config", None), "multiplex_profiles", False):
             with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
                 message_text = await self._prepare_inbound_message_text(
@@ -20390,20 +20390,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         *,
         source: SessionSource,
         session_key: Optional[str],
-    ) -> Optional[str]:
-        """Prepend the WhatsApp skill for explicit outbound requests only."""
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Prepend the WhatsApp skill without persisting it as user-authored text."""
         from gateway.whatsapp_intent import is_explicit_whatsapp_send_request
 
         if not is_explicit_whatsapp_send_request(message_text):
-            return message_text
+            return message_text, message_text
         platform = source.platform.value if source.platform else None
         from agent.skill_utils import get_disabled_skill_names
         if "whatsapp" in get_disabled_skill_names(platform=platform):
-            return message_text
+            return message_text, message_text
         from agent.skill_commands import _build_skill_message, _load_skill_payload
         loaded = _load_skill_payload("whatsapp", task_id=session_key)
         if not loaded:
-            return message_text
+            return message_text, message_text
         skill, skill_dir, display_name = loaded
         activation_note = (
             f'[IMPORTANT: The "{display_name}" skill was auto-loaded for an '
@@ -20411,9 +20411,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         skill_message = _build_skill_message(skill, skill_dir, activation_note)
         if not skill_message:
-            return message_text
+            return message_text, message_text
         logger.info("[Gateway] Auto-loaded WhatsApp skill for explicit outbound request")
-        return f"{skill_message}\n\n{message_text}"
+        return f"{skill_message}\n\n{message_text}", message_text
 
     async def _prepare_clarify_reply_text(self, event) -> str:
         """Return raw text or successful voice transcripts for a clarify reply."""
@@ -22570,7 +22570,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # attachments (documents, audio, etc.) are not sent to the vision
         # tool even when they appear in the same message.
         # -----------------------------------------------------------------
-        message_text = await self._prepare_profile_scoped_inbound_message_text(
+        message_text, persist_message_text = await self._prepare_profile_scoped_inbound_message_text(
             event=event,
             source=source,
             history=history,
@@ -22597,7 +22597,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if message_text and isinstance(message_text, str):
                 _clean_message_text, _embedded_ts = _strip_msg_ts(
                     message_text, tz=_evt_tz)
-                persist_user_message = _clean_message_text
+                _persist_message_text = persist_message_text or message_text
+                persist_user_message, _ = _strip_msg_ts(
+                    _persist_message_text, tz=_evt_tz
+                )
                 _event_epoch = _coerce_msg_ts(_evt_ts, tz=_evt_tz)
                 persist_user_timestamp = (
                     _event_epoch if _event_epoch is not None else _embedded_ts
@@ -32173,7 +32176,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_key or "?",
                             exc_info=True,
                         )
-                    next_message = await self._prepare_profile_scoped_inbound_message_text(
+                    next_message, next_persist_message = await self._prepare_profile_scoped_inbound_message_text(
                         event=pending_event,
                         source=next_source,
                         history=updated_history,
@@ -32239,6 +32242,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
+                    persist_user_message=next_persist_message,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

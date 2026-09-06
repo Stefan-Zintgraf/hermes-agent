@@ -17,6 +17,12 @@ _QUESTION_PATTERN = re.compile(
     r"^(?:what|why|can|how|when|where|was|warum|kann|wie|wann|wo)\b",
     re.IGNORECASE,
 )
+_SCHEDULE_PATTERN = re.compile(
+    r"\b(?:heute|morgen|übermorgen|today|tomorrow|tonight)\b"
+    r"[^\n]{0,40}?\b(?:um|at)?\s*\d{1,2}:\d{2}\b"
+    r"|\b\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}\b",
+    re.IGNORECASE,
+)
 
 
 def is_explicit_whatsapp_send_request(text: str | None) -> bool:
@@ -33,4 +39,4 @@ def is_explicit_whatsapp_send_request(text: str | None) -> bool:
         return False
     if normalized.endswith("?") or _QUESTION_PATTERN.search(normalized):
         return False
-    return bool(_ACTION_PATTERN.search(normalized))
+    return bool(_ACTION_PATTERN.search(normalized) or _SCHEDULE_PATTERN.search(normalized))
