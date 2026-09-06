@@ -20365,18 +20365,55 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Run inbound preprocessing under the routed profile when multiplexed."""
         if getattr(getattr(self, "config", None), "multiplex_profiles", False):
             with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
-                return await self._prepare_inbound_message_text(
+                message_text = await self._prepare_inbound_message_text(
                     event=event,
                     source=source,
                     history=history,
                     session_key=session_key,
                 )
-        return await self._prepare_inbound_message_text(
+                return self._prepend_whatsapp_skill_for_explicit_request(
+                    message_text, source=source, session_key=session_key
+                )
+        message_text = await self._prepare_inbound_message_text(
             event=event,
             source=source,
             history=history,
             session_key=session_key,
         )
+        return self._prepend_whatsapp_skill_for_explicit_request(
+            message_text, source=source, session_key=session_key
+        )
+
+    def _prepend_whatsapp_skill_for_explicit_request(
+        self,
+        message_text: Optional[str],
+        *,
+        source: SessionSource,
+        session_key: Optional[str],
+    ) -> Optional[str]:
+        """Prepend the WhatsApp skill for explicit outbound requests only."""
+        from gateway.whatsapp_intent import is_explicit_whatsapp_send_request
+
+        if not is_explicit_whatsapp_send_request(message_text):
+            return message_text
+        platform = source.platform.value if source.platform else None
+        from agent.skill_utils import get_disabled_skill_names
+        if "whatsapp" in get_disabled_skill_names(platform=platform):
+            return message_text
+        from agent.skill_commands import _build_skill_message, _load_skill_payload
+        loaded = _load_skill_payload("whatsapp", task_id=session_key)
+        if not loaded:
+            return message_text
+        skill, skill_dir, display_name = loaded
+        activation_note = (
+            f'[IMPORTANT: The "{display_name}" skill was auto-loaded for an '
+            "explicit outbound WhatsApp request. Follow its instructions for this turn.]"
+        )
+        skill_message = _build_skill_message(skill, skill_dir, activation_note)
+        if not skill_message:
+            return message_text
+        logger.info("[Gateway] Auto-loaded WhatsApp skill for explicit outbound request")
+        return f"{skill_message}\n\n{message_text}"
 
     async def _prepare_clarify_reply_text(self, event) -> str:
         """Return raw text or successful voice transcripts for a clarify reply."""
