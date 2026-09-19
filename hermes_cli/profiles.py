@@ -149,6 +149,32 @@ _CLONE_ALL_HISTORY_EXCLUDE_ROOT: frozenset[str] = frozenset({
 NO_BUNDLED_SKILLS_MARKER = ".no-bundled-skills"
 
 
+def _non_exportable_entries(directory: str, entries: List[str]) -> set[str]:
+    """Return special filesystem entries that :func:`shutil.copytree` cannot copy.
+
+    Live profiles can contain Unix sockets (notably ``gateway.sock``), FIFOs,
+    or device nodes.  Preserve symlinks because profile exports deliberately
+    retain them, but leave every other non-file/non-directory entry out of a
+    staged archive rather than allowing ``copytree`` to abort the export.
+    """
+    ignored: set[str] = set()
+    base = Path(directory)
+    for entry in entries:
+        try:
+            mode = (base / entry).lstat().st_mode
+        except OSError:
+            # Let copytree retain its normal error behavior for entries that
+            # disappear or cannot be inspected during the race with copying.
+            continue
+        if not (
+            stat.S_ISREG(mode)
+            or stat.S_ISDIR(mode)
+            or stat.S_ISLNK(mode)
+        ):
+            ignored.add(entry)
+    return ignored
+
+
 def has_bundled_skills_opt_out(profile_dir: Path) -> bool:
     """Return True if the profile opted out of bundled-skill seeding."""
     try:
@@ -181,15 +207,15 @@ def _clone_all_copytree_ignore(source_dir: Path):
     source_resolved = source_dir.resolve()
     is_default_source = source_resolved == _get_default_hermes_home().resolve()
 
-    def _ignore(directory: str, names: List[str]) -> List[str]:
-        ignored: list[str] = []
+    def _ignore(directory: str, names: List[str]) -> set[str]:
+        ignored = _non_exportable_entries(directory, names)
         for entry in names:
             # Universal exclusions at any depth.
             if (
                 entry == "__pycache__"
                 or entry.endswith((".pyc", ".pyo", ".sock", ".tmp"))
             ):
-                ignored.append(entry)
+                ignored.add(entry)
                 continue
             try:
                 at_root = Path(directory).resolve() == source_resolved
@@ -201,11 +227,11 @@ def _clone_all_copytree_ignore(source_dir: Path):
             if at_root:
                 # History artifacts: excluded for ANY source profile.
                 if entry in _CLONE_ALL_HISTORY_EXCLUDE_ROOT:
-                    ignored.append(entry)
+                    ignored.add(entry)
                     continue
                 # Infrastructure: only the default profile contains these.
                 if is_default_source and entry in _CLONE_ALL_DEFAULT_EXCLUDE_ROOT:
-                    ignored.append(entry)
+                    ignored.add(entry)
         return ignored
 
     return _ignore
@@ -2228,7 +2254,7 @@ def _default_export_ignore(root_dir: Path):
     """
 
     def _ignore(directory: str, contents: list) -> set:
-        ignored: set = set()
+        ignored = _non_exportable_entries(directory, contents)
         for entry in contents:
             # Universal exclusions (any depth)
             if entry == "__pycache__" or entry.endswith((".sock", ".tmp")):
@@ -2371,11 +2397,15 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
     with tempfile.TemporaryDirectory() as tmpdir:
         staged = Path(tmpdir) / canon
         _CREDENTIAL_FILES = {"auth.json", ".env"}
+
+        def _named_export_ignore(directory: str, contents: list) -> set:
+            return _CREDENTIAL_FILES & set(contents) | _non_exportable_entries(directory, contents)
+
         shutil.copytree(
             profile_dir,
             staged,
             symlinks=True,
-            ignore=lambda d, contents: _CREDENTIAL_FILES & set(contents),
+            ignore=_named_export_ignore,
         )
         _stage_extras(staged)
         _scrub_export_secrets(staged)

@@ -9,7 +9,12 @@ force-redacted in the staged archive (same pass as sessions --redact).
 The live profile on disk must stay untouched.
 """
 
+import socket
 import tarfile
+import tempfile
+from pathlib import Path
+
+import pytest
 
 from hermes_cli.profiles import export_profile, _DEFAULT_EXPORT_EXCLUDE_ROOT
 
@@ -57,6 +62,32 @@ class TestCredentialExclusion:
         assert any("SOUL.md" in n for n in names), "SOUL.md should be in export"
         assert not any("auth.json" in n for n in names), "auth.json must NOT be in export"
         assert not any(".env" in n for n in names), ".env must NOT be in export"
+
+    @pytest.mark.linux_only
+    def test_named_profile_export_skips_live_gateway_socket(self, tmp_path, monkeypatch):
+        """A live Linux gateway socket must not make a named-profile export fail."""
+        # AF_UNIX addresses are capped at about 108 bytes. pytest's isolated
+        # temp path is often longer, so create the source profile directly in
+        # the short system temp root to exercise the real live-socket case.
+        with tempfile.TemporaryDirectory(prefix="hp-") as socket_tmp:
+            profile_dir = Path(socket_tmp) / "testprofile"
+            profile_dir.mkdir()
+            (profile_dir / "config.yaml").write_text("model: gpt-4\n")
+            _patch_named_profile(monkeypatch, profile_dir.parent, profile_dir)
+
+            socket_path = profile_dir / "gateway.sock"
+            gateway_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            gateway_socket.bind(str(socket_path))
+            try:
+                result = export_profile("testprofile", str(tmp_path / "export.tar.gz"))
+            finally:
+                gateway_socket.close()
+
+        with tarfile.open(result, "r:gz") as tf:
+            names = tf.getnames()
+
+        assert "testprofile/config.yaml" in names
+        assert not any(name.endswith("gateway.sock") for name in names)
 
 
 class TestExportSecretScrub:
